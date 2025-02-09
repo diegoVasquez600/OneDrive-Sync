@@ -1,134 +1,226 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+/**
+ * main.ts
+ * Plugin principal de Obsidian para OneDrive Sync.
+ */
 
-// Remember to rename these classes and interfaces!
+import { Plugin, Notice, TFolder, TFile } from "obsidian";
+import { OneDriveConfig, OneDriveClient, exchangeAuthCodeForTokens } from "./src/clients/onedriveClient";
+import { OneDriveSettingTab } from "./src/clients/onedriveSettingsTab";
 
-interface MyPluginSettings {
-	mySetting: string;
+interface PluginSettings extends OneDriveConfig {
+  localVaultFolder: string;        // Carpeta local donde sincronizar
+  remoteBaseFolder: string;        // Carpeta remota en OneDrive
+  periodicSync: boolean;           // ¿sync cada X tiempo?
+  syncIntervalMinutes: number;     // Intervalo en minutos
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
+const DEFAULT_SETTINGS: PluginSettings = {
+  clientId: "TU-CLIENT-ID",
+  authority: "https://login.microsoftonline.com/consumers",
+  redirectUri: "obsidian://onedrive-auth",
+  accessToken: "",
+  refreshToken: "",
+  accessTokenExpiresAt: 0,
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+  localVaultFolder: "MyLocalVault",
+  remoteBaseFolder: "",
+  periodicSync: false,
+  syncIntervalMinutes: 5,
+};
 
-	async onload() {
-		await this.loadSettings();
+export default class OneDrivePlugin extends Plugin {
+  settings: PluginSettings;
+  pkceVerifier = "";
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+  // Status bar item
+  statusBarEl: HTMLElement | null = null;
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+  // Interval para sync periódico
+  syncIntervalId: number | null = null;
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+  async onload() {
+    console.log("Cargando Plugin OneDrive avanzado…");
+    await this.loadSettings();
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
+    // Creamos la SettingTab
+    this.addSettingTab(new OneDriveSettingTab(this.app, this));
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+    // Creamos un status bar item para mostrar "OneDrive: Idle" / "Syncing..."
+    this.statusBarEl = this.addStatusBarItem();
+    this.updateStatusBar("Idle");
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
+    // Protocol handler: obsidian://onedrive-auth?code=...
+    this.registerObsidianProtocolHandler("onedrive-auth", async (params) => {
+      if (!params.code) {
+        new Notice("No se recibió 'code' en callback.");
+        return;
+      }
+      try {
+        const result = await exchangeAuthCodeForTokens(this.settings, params.code, this.pkceVerifier);
+        if ("error" in result) {
+          new Notice("Error en la autenticación: " + result.error_description);
+        } else {
+          this.settings.accessToken = result.access_token;
+          this.settings.refreshToken = result.refresh_token ?? "";
+          const expiresInMs = (result.expires_in || 3600) * 1000;
+          this.settings.accessTokenExpiresAt = Date.now() + expiresInMs - 120000;
 
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
+          await this.saveSettings();
+          new Notice("¡Autenticación con OneDrive completada!");
+        }
+      } catch (err) {
+        console.error("Error al canjear el code:", err);
+        new Notice("Error al finalizar auth. Chequea la consola.");
+      }
+    });
 
-	onunload() {
+    // Comando manual "Sync Now"
+    this.addCommand({
+      id: "onedrive-sync-now",
+      name: "OneDrive: Sync Now",
+      callback: () => this.syncVault(),
+    });
 
-	}
+    // Configuramos los eventos de cambio de archivos
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        // Podrías filtrar si el file está dentro de localVaultFolder,
+        // y hacer un "debounce" para no sync en cada caracter
+        if (this.isAuthenticated()) {
+          // Podrías realizar un setTimeout si deseas.
+          this.syncVault();
+        }
+      })
+    );
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
+    // Sincronizar al iniciar
+    if (this.isAuthenticated()) {
+      this.syncVault();
+    }
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
+    // Configurar sync periódico
+    this.setupPeriodicSync();
+  }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
+  onUnload() {
+    console.log("Descargando plugin OneDrive...");
+    // Limpiamos el interval
+    if (this.syncIntervalId) {
+      window.clearInterval(this.syncIntervalId);
+    }
+  }
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
+  async loadSettings() {
+    const data = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+  }
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+  /**
+   * Indica si el plugin tiene tokens válidos.
+   */
+  isAuthenticated(): boolean {
+    return !!this.settings.accessToken && !!this.settings.refreshToken;
+  }
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+  /**
+   * Cambia el texto del status bar item.
+   */
+  updateStatusBar(status: string) {
+    if (this.statusBarEl) {
+      this.statusBarEl.setText(`OneDrive: ${status}`);
+    }
+  }
 
-	display(): void {
-		const {containerEl} = this;
+  /**
+   * Configura (o limpia) el interval para sync periódico, según settings.
+   */
+  setupPeriodicSync() {
+    if (this.syncIntervalId) {
+      window.clearInterval(this.syncIntervalId);
+      this.syncIntervalId = null;
+    }
 
-		containerEl.empty();
+    if (this.settings.periodicSync && this.settings.syncIntervalMinutes > 0) {
+      const ms = this.settings.syncIntervalMinutes * 60 * 1000;
+      this.syncIntervalId = window.setInterval(() => {
+        if (this.isAuthenticated()) {
+          this.syncVault();
+        }
+      }, ms);
+      console.log(`Sync periódico configurado cada ${this.settings.syncIntervalMinutes} min.`);
+    }
+  }
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+  /**
+   * Lógica principal para sincronizar el vault local con la carpeta remota.
+   * Ejemplo básico: subimos todos los archivos de localVaultFolder. 
+   * (No implementa "descarga" o "delta" para simplificar).
+   */
+  async syncVault() {
+    if (!this.isAuthenticated()) {
+      new Notice("No estás autenticado en OneDrive.");
+      return;
+    }
+
+    try {
+      this.updateStatusBar("Syncing...");
+      const client = new OneDriveClient(this.settings);
+
+      // 1. Lista archivos en la carpeta local
+      const localFolderPath = this.settings.localVaultFolder;
+      const localFolder = this.app.vault.getAbstractFileByPath(localFolderPath);
+      if (!localFolder || !(localFolder instanceof TFolder)) {
+        new Notice(`Carpeta local '${localFolderPath}' no existe en el Vault.`);
+        this.updateStatusBar("Error: no local folder");
+        return;
+      }
+
+      // Recorremos recursivamente esa carpeta local
+      const allFiles = this.getAllFilesInFolder(localFolderPath);
+
+      // 2. Sube cada archivo a OneDrive (sobreescribe).
+      for (const file of allFiles) {
+        const arrayBuf = await this.app.vault.readBinary(file);
+        const relativePath = file.path.substring(localFolderPath.length + 1); 
+        // Ej: si file.path = "MyLocalVault/Notas/test.md" => relativePath= "Notas/test.md"
+        await client.uploadFile(relativePath, arrayBuf);
+      }
+
+      new Notice(`Sync completado. Subidos ${allFiles.length} archivos.`);
+      this.updateStatusBar("Idle");
+    } catch (err) {
+      console.error("Error al syncVault:", err);
+      this.updateStatusBar("Error");
+      new Notice("Error al sincronizar con OneDrive. Ver consola.");
+    }
+  }
+
+  /**
+   * Devuelve todos los archivos .md (o todos) en la carpeta local.
+   * Ajusta a tus preferencias (filtrar .md o subir todo).
+   */
+  getAllFilesInFolder(folderPath: string) {
+    const folder = this.app.vault.getAbstractFileByPath(folderPath);
+    const result: TFile[] = [];
+
+    const recurse = (f: TFolder) => {
+      for (const child of f.children) {
+        if (child instanceof TFile) {
+          // Filtra si deseas .md, .pdf, etc.
+          result.push(child);
+        } else if (child instanceof TFolder) {
+          recurse(child);
+        }
+      }
+    };
+
+    if (folder && folder instanceof TFolder) {
+      recurse(folder);
+    }
+    return result;
+  }
 }

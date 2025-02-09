@@ -1,16 +1,22 @@
-# Obsidian Sample Plugin
+# OneDrive Sync Plugin
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+This is a OneDrive Sync plugin for Obsidian(https://obsidian.md).
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+## Features
+- Syncs your Obsidian vault with OneDrive
+- Supports multiple vaults
+- Supports multiple OneDrive accounts (In the future)
+- Supports OneDrive for Business (In the future)
+- Supports OneDrive Personal
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open Sample Modal" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and output 'click' to the console.
-- Registers a global interval which logs 'setInterval' to the console.
+
+## How to use
+- Install the plugin
+- Go to the settings and click on the OneDrive Sync tab
+- Click on the "Connect to OneDrive" button
+- Follow the instructions to connect your OneDrive account
+- Select the vault you want to sync
+- Click on the "Sync" button to start syncing your vault
 
 ## First time developing plugins?
 
